@@ -7,16 +7,26 @@ from bs4 import BeautifulSoup
 from docx import Document
 from htmldocx import HtmlToDocx
 from re import match
+from multiprocessing import Process, Lock
 import copy
 import os
+import psutil
+import gc
 
 # Contains the directory_list
 from list import directory_list, avoid_list
 
 # Where to find the HTML
 base_directory = "../ry-tietomallit/docs/_site/"
+
 # Base URL online
 base_url = "https://tietomallit.ymparisto.fi/"
+
+# Output goes here
+output_dir = "./output"
+
+# Would like you threads ? that with (actually Processes)
+use_threads = True
 
 counters = {"main_content_wrap":0, "page_body":0, "body": 0, "html_files":0}
 
@@ -42,14 +52,12 @@ def dig_for_html(root, dir, avoid_list, avoid):
     
     return html_files
 
+def get_mem_usage():
+    return psutil.Process(os.getpid()).memory_info().rss // 1024
 
-
-# Build list of HTML files we want to include in the DocXs.
-# We want to avoid recursing into subdirectories that are in
-# the avoid list, but the first level can't use the avoid list
-# as all the directories are in it.
-avoid_list.extend(directory_list)
-for dir in directory_list:
+# Handle one directory of stuff
+def convert_dir(dir):
+    global counters
     # Where it all will end up
     if dir == "":
         output_file = "rytj-sisalto.docx"
@@ -62,8 +70,11 @@ for dir in directory_list:
 
     html_files = dig_for_html(base_directory, dir, avoid_list, False)
     # print(dir + " ", len(html_files), " HTML files found")
+
+    lock.acquire() # Do we need locking if using processes?
     counters["html_files"] = counters["html_files"] + len(html_files)
-    
+    lock.release()
+                    
     # do stuff to documents
     for html in html_files:
         f = open(os.path.join(base_directory, html))
@@ -86,11 +97,12 @@ for dir in directory_list:
            
         # Some of our documents have a div with id="main_content_wrap",
         # use the contents of that if present
-        bread_text = html_doc.find("div",id="main_content_wrap")
-        if bread_text is not None:
+        if (bread_text := html_doc.find("div",id="main_content_wrap") ) is not None:
             try:
                 converter.add_html_to_document(str(bread_text), docx)
+                lock.acquire()
                 counters["main_content_wrap"] = counters["main_content_wrap"] + 1
+                lock.release()
                 print(html + ": main_content_wrap", len(str(bread_text)) )
             except:
                 print(html + ": EXCEPTION/main_content_wrap", len(str(bread_text)) )
@@ -99,33 +111,58 @@ for dir in directory_list:
         # The files with a <div class="PageBody"> seem to have
         # tables with colspan and rowspan, which tickle a bug in htmldocx.
         # (see https://github.com/pqzx/html2docx/search?q=indexerror&type=issues)
-        bread_text = html_doc.find("div",class_="PageBody")
-        if bread_text is not None:
+        
+        elif (bread_text := html_doc.find("div",class_="PageBody") ) is not None:
             try:
                 # The converter object will be unusable if we encounter an exception
                 backup = copy.deepcopy(converter)
                 converter.add_html_to_document(str(bread_text), docx)
+                lock.acquire()
                 counters["page_body"] = counters["page_body"] + 1
+                lock.release()
                 print(html + ": pagebody", len(str(bread_text)) )
             except:
                 # Roll back possible fuckups?
                 converter = backup
                 print(html + ": EXCEPTION/pagebody", len(str(bread_text)) )
-            continue
-
         # Last resort, use the body element
-        bread_text = html_doc.find("body")
-        if bread_text is not None:
+        elif (bread_text := html_doc.find("body") ) is not None:
             try:
                 backup = copy.deepcopy(converter)
                 converter.add_html_to_document(str(bread_text), docx)
+                lock.acquire()
                 counters["body"] = counters["body"] + 1
+                lock.release()
                 print(html + ": body", len(str(bread_text)) )
             except:
                 converter = backup
                 print(html + ": EXCEPTION/body", len(str(bread_text)) )
-            continue
-            
+        else:
+            print(html + ": NO STRATEGY")
 
-    docx.save(output_file)
+    docx.save(os.path.join(output_dir, output_file))
+    mem = get_mem_usage()
+    print(f"----- Memory usage at end of {dir} processing: {mem} KB")
+    del docx
+    del converter
+    gc.collect()
+    
+# We want to avoid recursing into subdirectories that are in
+# the avoid list, so we add them here.
+avoid_list.extend(directory_list)
+lock = Lock()
+
+if use_threads:
+    for dir in directory_list:
+        threads = []
+        threads.append(Process(target=convert_dir, args=(dir,)))
+        threads[-1].start()
+        
+    for t in threads:
+        t.join()
+else:
+    for dir in directory_list:
+        convert_dir(dir)
+
+
 print(counters)
