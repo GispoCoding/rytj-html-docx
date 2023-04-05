@@ -8,6 +8,7 @@ import gc
 from multiprocessing import Process, Lock
 import os
 import psutil
+import requests
 from re import match
 
 from bs4 import BeautifulSoup
@@ -31,9 +32,9 @@ base_url = "https://tietomallit.ymparisto.fi/"
 output_dir = "./output"
 
 # Would like you threads ? that with (actually Processes)
-use_threads = True
+use_threads = False
 
-counters = {"main_content_wrap": 0, "page_body": 0, "body": 0, "html_files": 0}
+counters = {"main_content_wrap": 0, "PageBody": 0, "body": 0, "html_files": 0}
 
 # Recurse from root down, avoid paths in avoidlist
 # Return list of all HTML files found, width first search
@@ -61,6 +62,29 @@ def dig_for_html(root, dir, avoid_list, avoid):
 
 def get_mem_usage():
     return psutil.Process(os.getpid()).memory_info().rss // 1024
+
+# Simple True/False check for an URL
+def ping_url(url):
+    # Some servers play hard to get, so we have to jump a few hoops,
+    # i.e. send all these headers and use GET instead of HEAD 
+    request_headers = { "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36 Edg/111.0.1661.54",
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "accept_encoding": "gzip, deflate, br",
+                "accept-language": "en-US,en;q=0.9,fi;q=0.8,sv;q=0.7",
+                "upgrade-insecure-requests": "1"}
+    if match("^http", url):
+        try:
+            r = requests.get(url, allow_redirects = True, timeout = 3,
+                              headers = request_headers)
+            print(f"{url} {r.status_code} <- {r.history}")
+            r.raise_for_status()
+            return True
+        except:
+            return False
+    else:
+        # Local files are always found for now
+        # or should they be checked as well?
+        return True
 
 # Handle one directory of stuff
 def convert_dir(dir):
@@ -102,54 +126,48 @@ def convert_dir(dir):
         converter.add_html_to_document(
             "<h2>&gt;&gt; " + title + " ( " + link + " )</h2>", docx)
 
+        found = False
         # Some of our documents have a div with id="main_content_wrap",
         # use the contents of that if present
         if (bread_text := html_doc.find("div", id="main_content_wrap")) is not None:
-            try:
-                converter.add_html_to_document(str(bread_text), docx)
-                lock.acquire()
-                counters["main_content_wrap"] = counters["main_content_wrap"] + 1
-                lock.release()
-                print(html + ": main_content_wrap", len(str(bread_text)))
-            except:
-                print(html + ": EXCEPTION/main_content_wrap",
-                      len(str(bread_text)))
-            continue
+            found = "main_content_wrap"
 
         # The files with a <div class="PageBody"> seem to have
         # tables with colspan and rowspan, which tickle a bug in htmldocx.
         # (see https://github.com/pqzx/html2docx/search?q=indexerror&type=issues)
 
         elif (bread_text := html_doc.find("div", class_="PageBody")) is not None:
-            try:
-                # The converter object will be unusable if we encounter an exception
-                backup = copy.deepcopy(converter)
-                converter.add_html_to_document(str(bread_text), docx)
-                lock.acquire()
-                counters["page_body"] = counters["page_body"] + 1
-                lock.release()
-                print(html + ": pagebody", len(str(bread_text)))
-            except:
-                # Roll back possible failures
-                converter = backup
-                print(html + ": EXCEPTION/pagebody", len(str(bread_text)))
+            found = "PageBody"
                 
         # Last resort, use the body element
         elif (bread_text := html_doc.find("body")) is not None:
+            found = "body"
+
+
+        if not found:
+            print(f"{html}: NO STRATEGY")
+        else:
+            links = bread_text.find_all('a')
+            #print(f"{html}: {len(links)} links")
+            for link in links:
+                if 'href' in link and not ping_url(link['href']):
+                    link.append(" [LINKKI RIKKI?]")
+                    #print(f"{html} Broken link: {link['href']}")
             try:
+                # The converter object might be unusable if we encounter an exception
                 backup = copy.deepcopy(converter)
                 converter.add_html_to_document(str(bread_text), docx)
                 lock.acquire()
-                counters["body"] = counters["body"] + 1
+                counters[found] += 1
                 lock.release()
-                print(html + ": body", len(str(bread_text)))
+                print(f"{html}: {found} {len(str(bread_text))}")
             except:
+                # Roll back possible failures
                 converter = backup
-                print(html + ": EXCEPTION/body", len(str(bread_text)))
+                print(f"{html}: EXCEPTION/{found} {len(str(bread_text))}")
+            del backup
 
-        else:
-            print(html + ": NO STRATEGY")
-
+            
     docx.save(os.path.join(output_dir, output_file))
     mem = get_mem_usage()
     print(f"----- Memory usage at end of {dir} processing: {mem} KB")
