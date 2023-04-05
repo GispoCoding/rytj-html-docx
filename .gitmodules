@@ -1,0 +1,3 @@
+[submodule "ry-tietomallit"]
+	path = ry-tietomallit
+	url = https://github.com/sykefi/ry-tietomallit/
